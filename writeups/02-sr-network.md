@@ -8,60 +8,110 @@
 
 ## The short version
 
-A website had a feature that quietly spent from a shared pool of "credits" every single time
-it ran, and nothing stopped me from running it over and over. Once I drained that pool all the
-way to zero, the error message the server returned handed me the flag.
+A website had a feature that quietly spent from a shared pool of "credits" every single time it
+ran, and nothing stopped me from running it over and over. Once I drained that pool all the way
+to zero, the error message the server returned handed me the flag.
 
-## Walkthrough
+## Background on the challenge
 
-The app for this one was called the "Star Forger Signal Relay." The first thing I did was pull
-up its API documentation, which it exposed publicly, and that documentation included a very
-honest developer note on the password-reset feature:
+The target was the "Star Forger Signal Relay," a web service built on **FastAPI**. The story
+framing it was that an attacker was "rapidly consuming the corporation's quantum credits,"
+disrupting communication across the galaxy. That story detail ended up being a direct hint at the
+vulnerability: the whole challenge was about exhausting a shared resource. The challenge brief
+also mentioned that API documentation was available at `/docs/`, which is important because
+FastAPI auto-generates interactive API docs, and those docs often hand an attacker the entire map
+of the application for free.
 
-> *"One request consumes 15 star tokens. TODO: add proper rate limiting to prevent star credit
+## Step-by-step walkthrough
+
+**Step 1 — Recon the service.**
+I started by fingerprinting the target and confirmed it was a FastAPI/uvicorn app. The fact that
+`/docs/` worked (the Swagger UI) confirmed this, so my next move was to pull the machine-readable
+version of that documentation.
+
+**Step 2 — Pull the full API specification.**
+FastAPI exposes a complete spec at `/openapi.json`. I requested it, which gave me every route, its
+parameters, and its description text in one place:
+
+```bash
+curl http://<target>/openapi.json
+```
+
+This is important because it meant I did not have to guess at hidden endpoints — the app told me
+exactly what it had.
+
+**Step 3 — Spot the giveaway in the docs.**
+Reading through the spec, one endpoint stood out immediately. The password-reset request route had
+a developer note left right in its description:
+
+> *"One request consume 15 star token. TODO: add proper rate limiting to prevent star credit
 > depletion."*
 
-As a result, I knew exactly where to look. That one note told me that every call to the reset
-endpoint spends 15 credits out of a single shared company-wide pool, that there is no limit on
-how often it can be called, and that it doesn't even require a login. This is important because
-it means the intended attack was simply to call that endpoint enough times to drain the pool.
+As a result, I had both the vulnerability and the intended attack handed to me: each call to this
+endpoint spends 15 credits from a shared pool, and there is no rate limiting to stop repeated
+calls.
 
-I was actually already hitting that endpoint repeatedly to test how the reset flow worked, and
-in doing so I drained the shared pool down to empty. Once it hit zero, the server's failure
-response leaked the key directly in the body:
+**Step 4 — Register a test account and map the credit system.**
+To understand how the app behaved while authenticated, I registered a test user and logged in. I
+noticed my account was user ID 2, which suggested there was a seeded admin or privileged account
+at ID 1. I pulled the dashboard and profile pages to look for where a "star balance" or the flag
+might be shown, but the balance was not exposed directly in those pages.
+
+**Step 5 — Probe the reset endpoint and discover two bonus leaks.**
+I began calling the password-reset request endpoint to study the reset flow. In doing so I noticed
+two extra weaknesses that were not strictly required but confirmed I was on the right track:
+- It acted as a **user-enumeration oracle** — a real username returned a detailed response
+  including a `code_hint`, while an unknown username returned a generic "if this user exists"
+  message.
+- It **leaked the first digit of the one-time passcode** (for example, `"starts with '9'"`).
+
+**Step 6 — Drain the shared credit pool.**
+Because each reset request spends 15 credits from one shared company-wide pool, and because I was
+already hammering that endpoint (both to test the flow and to enumerate usernames), the shared
+pool steadily drained. This is important because, unlike a per-user limit, the pool is global —
+so my repeated unauthenticated calls were depleting the same balance the whole "company" relied
+on.
+
+**Step 7 — Catch the flag in the failure response.**
+Once the pool hit zero, the endpoint stopped behaving normally and instead returned its
+depleted-state error — and that error response contained the key directly in its body:
 
 ```json
 {
+  "error": "Error: Company star credits depleted",
   "status": "company_credits_empty",
   "forge_signal_key": "HTB{f0rg3_s1gn4l_k3y_0v3rl0ad_y3y_6af947840b1b58a27f6f514738fbd823}"
 }
 ```
 
-Overall, this lined up perfectly with the challenge's story about an attacker "rapidly
-consuming the corporation's quantum credits." The lesson here is that anything that spends a
-shared or billable resource needs a rate limit, and error messages should never contain
-secrets.
+**Step 8 — Submit the flag.**
+I pasted `HTB{f0rg3_s1gn4l_k3y_0v3rl0ad_y3y_6af947840b1b58a27f6f514738fbd823}` into the flag box.
+Overall, this matched the challenge's story about draining the corporation's quantum credits
+exactly.
 
 ## Technical detail
 
-- **Stack:** FastAPI (Swagger UI at `/docs/`, spec at `/openapi.json`).
-- **Recon:** the OpenAPI spec disclosed the full route map. The reset route's description
-  included the exact cost and the missing control: *"One request consume 15 star token. TODO:
-  add proper rate limiting…"*
+- **Stack:** FastAPI (Swagger UI at `/docs/`, OpenAPI spec at `/openapi.json`).
 - **Vulnerable endpoint:** `POST /api/auth/password/reset/request` — unauthenticated, no rate
   limit, deducts 15 credits per call from a single global pool.
-- **Exploit:** repeated calls (also used for user enumeration) drained the global pool. The
-  depleted-state response body leaks the key:
-  ```json
-  {"error":"Error: Company star credits depleted","status":"company_credits_empty",
-   "forge_signal_key":"HTB{f0rg3_s1gn4l_k3y_0v3rl0ad_y3y_6af947840b1b58a27f6f514738fbd823}"}
-  ```
-- **Secondary leaks (not required):** the reset response is a user-enumeration oracle (valid
-  user returns a `code_hint`; unknown returns a generic message) and leaks the OTP's first
-  digit (e.g. `"starts with '9'"`).
-- **Mitigation:** rate-limit and authenticate resource-spending endpoints; never return secret
-  material in an error/failure state.
+- **Root cause:** a shared, finite resource (the credit pool) is spent by an endpoint that any
+  anonymous user can call an unlimited number of times.
+- **Information leak on failure:** the depleted-state response discloses the secret key, turning a
+  denial-of-service condition into a full secret disclosure.
+- **Secondary issues:** user enumeration via differential responses, and partial OTP disclosure
+  (first digit).
 
----
+## Lessons / remediation
 
-*Tools used: curl, and the app's own OpenAPI/Swagger docs.*
+- **Rate-limit any endpoint that spends a shared or billable resource**, and require
+  authentication where appropriate. This is the exact fix the developer's own TODO comment
+  described.
+- **Never place secrets in an error or failure response.** The depletion message should have been
+  a neutral error, not a carrier for the key.
+- **Return uniform responses** for valid and invalid usernames to prevent enumeration, and never
+  leak any part of an OTP.
+
+## Tools used
+
+- `curl`, for probing endpoints and pulling the OpenAPI spec.
+- The app's own Swagger / OpenAPI documentation, which disclosed the full attack surface.
